@@ -1,0 +1,153 @@
+name: Image vulnerability scan
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile_context:
+        description: "Build context passed to docker/build-push-action"
+        type: string
+        required: false
+        default: "."
+      image_ref:
+        description: "Image name to build and scan, without tag (e.g. scan-target)"
+        type: string
+        required: true
+      version:
+        description: "Tag to apply to image_ref for this scan, and to use in report/artifact names"
+        type: string
+        required: true
+      trivy_version:
+        description: "aquasec/trivy image tag to run"
+        type: string
+        required: false
+        default: "0.70.0"
+      severity:
+        description: "Comma-separated severities to gate on"
+        type: string
+        required: false
+        default: "HIGH,CRITICAL"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    # Caller must grant at least this much via the calling job's `permissions:` block.
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      # Reusable workflows run in the calling repo's context, so this checks out
+      # the caller's code (e.g. docker-image-pipeline), not this workflow's own repo.
+      - name: Check out calling repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build a local, single-arch image purely to scan before anything is pushed.
+      # Buildx can't --load a multi-platform manifest into the local daemon, so we
+      # scan the amd64 variant here. Shares the caller's GHA cache scope, so this
+      # rebuild reuses layers from any earlier build in the same workflow run.
+      - name: Build image for scanning (amd64, local only)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.dockerfile_context }}
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: ${{ inputs.image_ref }}:${{ inputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Cache Trivy's vulnerability DB across the multiple scans below and across
+      # runs, otherwise each `docker run` re-downloads the full DB (slow, and hits
+      # rate limits).
+      - name: Restore Trivy DB cache
+        uses: actions/cache@v4
+        with:
+          path: .trivy-cache
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+
+      - name: Trivy scan (SARIF, for Security tab / PR annotations)
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}":/work \
+            -v "${{ github.workspace }}/.trivy-cache":/root/.cache/trivy \
+            aquasec/trivy:${{ inputs.trivy_version }} image \
+            --format sarif --output /work/trivy-results.sarif \
+            --severity ${{ inputs.severity }} \
+            ${{ inputs.image_ref }}:${{ inputs.version }}
+
+      - name: Upload SARIF to Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Trivy scan (table, for job summary)
+        if: always()
+        run: |
+          {
+            echo '```'
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "${{ github.workspace }}/.trivy-cache":/root/.cache/trivy \
+              aquasec/trivy:${{ inputs.trivy_version }} image \
+              --format table --severity ${{ inputs.severity }} \
+              ${{ inputs.image_ref }}:${{ inputs.version }}
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Trivy has no native "html" format; it renders one via the html.tpl template
+      # from its own repo. Pin the template to trivy_version so it always matches
+      # the scanner binary's output schema.
+      - name: Download Trivy HTML report template
+        if: always()
+        run: |
+          mkdir -p contrib
+          curl -sSL -o contrib/html.tpl \
+            "https://raw.githubusercontent.com/aquasecurity/trivy/v${{ inputs.trivy_version }}/contrib/html.tpl"
+
+      - name: Trivy scan (HTML report, for artifact)
+        if: always()
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}":/work \
+            -v "${{ github.workspace }}/contrib":/contrib \
+            -v "${{ github.workspace }}/.trivy-cache":/root/.cache/trivy \
+            aquasec/trivy:${{ inputs.trivy_version }} image \
+            --format template --template "@/contrib/html.tpl" \
+            --output /work/trivy-full-report.html \
+            ${{ inputs.image_ref }}:${{ inputs.version }}
+
+      - name: Upload scan report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report-${{ inputs.version }}
+          path: |
+            trivy-results.sarif
+            trivy-full-report.html
+          retention-days: 30
+
+      # Fail the pipeline before anything reaches Docker Hub if HIGH/CRITICAL CVEs
+      # exist AND a fix is available. Unfixed CVEs still show up in the job summary,
+      # HTML report artifact, and Security tab above (none of which filter them) for tracking.
+      - name: Gate on vulnerabilities
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${{ github.workspace }}/.trivy-cache":/root/.cache/trivy \
+            aquasec/trivy:${{ inputs.trivy_version }} image \
+            --exit-code 1 --severity ${{ inputs.severity }} --ignore-unfixed \
+            ${{ inputs.image_ref }}:${{ inputs.version }}
+
+      # Every `docker run` above writes into .trivy-cache as root (the container's
+      # default user), but the runner's own user isn't root. actions/cache's
+      # automatic post-job save can't tar root-owned files, so it silently fails
+      # ("Failed to save... tar ... exit code 2") and the cache is never persisted.
+      - name: Fix Trivy cache ownership before caching
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" .trivy-cache
