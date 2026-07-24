@@ -31,9 +31,13 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     # Caller must grant at least this much via the calling job's `permissions:` block.
+    # actions: read is required by github/codeql-action/upload-sarif when the
+    # calling repo is private (GitHub Actions token permissions are the
+    # intersection of caller and callee, so both sides need it).
     permissions:
       contents: read
       security-events: write
+      actions: read
     steps:
       # Reusable workflows run in the calling repo's context, so this checks out
       # the caller's code (e.g. docker-image-pipeline), not this workflow's own repo.
