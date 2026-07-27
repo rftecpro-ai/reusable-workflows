@@ -1,0 +1,121 @@
+name: SonarQube Community Build scan
+
+on:
+  workflow_call:
+    inputs:
+      project_key:
+        description: "Unique SonarQube project key for this scan"
+        type: string
+        required: true
+      sources:
+        description: "Path (relative to repo root) analyzed as the project base dir"
+        type: string
+        required: false
+        default: "."
+      sonarqube_tag:
+        description: "sonarqube Docker Hub image tag to run"
+        type: string
+        required: false
+        default: "community"
+      fail_on_quality_gate:
+        description: "Fail the job if the Quality Gate doesn't pass"
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    # Caller must grant at least this much via the calling job's `permissions:` block.
+    permissions:
+      contents: read
+    steps:
+      # Reusable workflows run in the calling repo's context, so this checks out
+      # the caller's code, not this workflow's own repo.
+      - name: Check out calling repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # SCM/blame data needs full history, not the default shallow clone
+
+      # SonarQube bundles Elasticsearch, which fails its bootstrap checks under
+      # the runner's default vm.max_map_count (65530 vs. the 262144 it needs).
+      # This has to happen before the container starts, so the container is
+      # started by hand below instead of declared as a `services:` entry -
+      # services start before any step gets a chance to run this.
+      - name: Raise vm.max_map_count for the bundled Elasticsearch
+        run: sudo sysctl -w vm.max_map_count=262144
+
+      # Ephemeral by design: this spins up a brand-new, historyless SonarQube
+      # instance for this run only and tears it down at the end, rather than
+      # pointing at a persistent server. Trade-off: there's no analysis from a
+      # previous run to diff against, so the Quality Gate's "new code"
+      # conditions below evaluate against the whole codebase every run, not
+      # just what changed. Simple and self-contained (no server to host, no
+      # secrets to manage), at the cost of cross-run history and trend data.
+      - name: Start ephemeral SonarQube Community Build
+        run: docker run -d --name sonarqube -p 9000:9000 sonarqube:${{ inputs.sonarqube_tag }}
+
+      - name: Wait for SonarQube to come up
+        run: |
+          for i in $(seq 1 60); do
+            status=$(curl -s -u admin:admin http://localhost:9000/api/system/status | jq -r .status 2>/dev/null || true)
+            if [ "$status" = "UP" ]; then
+              echo "SonarQube is up"
+              exit 0
+            fi
+            echo "waiting for SonarQube ($i/60)..."
+            sleep 5
+          done
+          echo "::error::SonarQube didn't come up in time"
+          docker logs sonarqube
+          exit 1
+
+      # The default admin/admin credentials are only ever reachable on
+      # localhost inside this job, and the whole instance is destroyed in the
+      # last step regardless of outcome - there's no persisted account to
+      # rotate credentials on, unlike a long-lived server.
+      - name: Generate a one-off analysis token
+        id: sonar_token
+        run: |
+          token=$(curl -s -u admin:admin -X POST "http://localhost:9000/api/user_tokens/generate" \
+            --data-urlencode "name=ci-$(date +%s)" | jq -r .token)
+          echo "::add-mask::$token"
+          echo "value=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Create SonarQube project
+        run: |
+          curl -s -u admin:admin -X POST "http://localhost:9000/api/projects/create" \
+            --data-urlencode "project=${{ inputs.project_key }}" \
+            --data-urlencode "name=${{ inputs.project_key }}"
+
+      - name: Run SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ steps.sonar_token.outputs.value }}
+          SONAR_HOST_URL: http://localhost:9000
+        with:
+          projectBaseDir: ${{ inputs.sources }}
+          args: -Dsonar.projectKey=${{ inputs.project_key }}
+
+      - name: Check Quality Gate
+        if: inputs.fail_on_quality_gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ steps.sonar_token.outputs.value }}
+          SONAR_HOST_URL: http://localhost:9000
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### SonarQube scan: \`${{ inputs.project_key }}\`"
+            echo
+            curl -s -u admin:admin \
+              "http://localhost:9000/api/issues/search?componentKeys=${{ inputs.project_key }}&resolved=false&ps=100" \
+              | jq -r 'if (.issues | length) == 0 then "No open issues." else (.issues[] | "- **\(.severity)** `\(.rule)`: \(.message) (`\(.component)`\(if .line then ":\(.line)" else "" end))") end'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tear down ephemeral SonarQube
+        if: always()
+        run: docker rm -f sonarqube || true
