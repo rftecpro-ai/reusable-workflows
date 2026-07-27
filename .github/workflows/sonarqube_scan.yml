@@ -97,6 +97,10 @@ jobs:
           projectBaseDir: ${{ inputs.sources }}
           args: -Dsonar.projectKey=${{ inputs.project_key }}
 
+      # report-task.txt is written under sonar.projectBaseDir (`inputs.sources`
+      # above), not the repo root - this action's default location - so it has
+      # to be pointed there explicitly, or it fails with "does not exist"
+      # even though the scan itself succeeded.
       - name: Check Quality Gate
         if: inputs.fail_on_quality_gate
         uses: SonarSource/sonarqube-quality-gate-action@v1
@@ -104,6 +108,8 @@ jobs:
         env:
           SONAR_TOKEN: ${{ steps.sonar_token.outputs.value }}
           SONAR_HOST_URL: http://localhost:9000
+        with:
+          scanMetadataReportFile: ${{ inputs.sources }}/.scannerwork/report-task.txt
 
       - name: Job summary
         if: always()
