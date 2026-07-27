@@ -83,8 +83,14 @@ jobs:
             --severity ${{ inputs.severity }} \
             ${{ inputs.image_ref }}:${{ inputs.version }}
 
+      # Code scanning (and thus this upload) requires a GitHub Advanced
+      # Security license on private repos. continue-on-error keeps that
+      # unlicensed/not-yet-enabled case from failing the whole job — the
+      # table/HTML report below and the hard vulnerability gate still run
+      # and still enforce severity regardless of this step's outcome.
       - name: Upload SARIF to Code Scanning
         if: always()
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: trivy-results.sarif
