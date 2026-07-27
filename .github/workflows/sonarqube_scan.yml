@@ -122,6 +122,48 @@ jobs:
               | jq -r 'if (.issues | length) == 0 then "No open issues." else (.issues[] | "- **\(.severity)** `\(.rule)`: \(.message) (`\(.component)`\(if .line then ":\(.line)" else "" end))") end'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The ephemeral instance (and its issue history) is destroyed in the
+      # next step regardless of outcome, so this is the only lasting record
+      # of what this run found - unlike the job summary above, it isn't
+      # truncated to one page and survives past the job for the artifact's
+      # retention window.
+      - name: Generate HTML report
+        if: always()
+        run: |
+          issues_json=$(curl -s -u admin:admin \
+            "http://localhost:9000/api/issues/search?componentKeys=${{ inputs.project_key }}&resolved=false&ps=500")
+          gate_json=$(curl -s -u admin:admin \
+            "http://localhost:9000/api/qualitygates/project_status?projectKey=${{ inputs.project_key }}")
+          gate_status=$(echo "$gate_json" | jq -r '.projectStatus.status // "UNKNOWN"')
+
+          {
+            echo '<!doctype html><html><head><meta charset="utf-8">'
+            echo "<title>SonarQube report: ${{ inputs.project_key }}</title>"
+            echo '<style>body{font-family:sans-serif;margin:2rem}table{border-collapse:collapse;width:100%;margin-bottom:2rem}th,td{border:1px solid #ccc;padding:6px 10px;text-align:left;font-size:14px}th{background:#f5f5f5}.status-OK{color:#0a0}.status-ERROR{color:#b00}</style>'
+            echo '</head><body>'
+            echo "<h1>SonarQube scan: ${{ inputs.project_key }}</h1>"
+            echo "<p>Quality Gate: <strong class=\"status-$gate_status\">$gate_status</strong></p>"
+
+            echo '<h2>Quality Gate conditions</h2>'
+            echo '<table><tr><th>Metric</th><th>Comparator</th><th>Threshold</th><th>Actual</th><th>Status</th></tr>'
+            echo "$gate_json" | jq -r '.projectStatus.conditions[]? | "<tr><td>\(.metricKey)</td><td>\(.comparator)</td><td>\(.errorThreshold // "-")</td><td>\(.actualValue // "-")</td><td>\(.status)</td></tr>"'
+            echo '</table>'
+
+            echo '<h2>Open issues</h2>'
+            echo '<table><tr><th>Severity</th><th>Rule</th><th>Message</th><th>Component</th><th>Line</th></tr>'
+            echo "$issues_json" | jq -r '.issues[]? | "<tr><td>\(.severity)</td><td>\(.rule|@html)</td><td>\(.message|@html)</td><td>\(.component|@html)</td><td>\(.line // "-")</td></tr>"'
+            echo '</table>'
+            echo '</body></html>'
+          } > sonarqube-report.html
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-report-${{ inputs.project_key }}
+          path: sonarqube-report.html
+          retention-days: 30
+
       - name: Tear down ephemeral SonarQube
         if: always()
         run: docker rm -f sonarqube || true

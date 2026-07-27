@@ -39,9 +39,10 @@ code_scan:
 
 ## What it produces
 
-- A job summary listing every open issue SonarQube found (severity, rule, message, location).
+- A job summary listing every open issue SonarQube found (severity, rule, message, location) - truncated to the first 100.
+- An HTML report uploaded as a `sonarqube-report-<project_key>` artifact (30-day retention): Quality Gate status and conditions, plus up to 500 open issues - the more complete record, since the job summary above is capped lower.
 - A hard failure if `fail_on_quality_gate` is true and the Quality Gate status isn't `OK`.
-- Nothing persists after the job ends - the SonarQube instance (and any issue history) is destroyed in the last step regardless of outcome. There is no Security tab integration and no cross-run trend; re-run the workflow to see current findings.
+- No Security tab integration and no cross-run trend - the SonarQube instance (and any issue history beyond what's in the report artifact) is destroyed in the last step regardless of outcome. Re-run the workflow to see current findings.
 
 ## Caller requirements
 
