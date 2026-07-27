@@ -29,6 +29,7 @@ on:
 
 jobs:
   scan:
+    name: Trivy
     runs-on: ubuntu-latest
     # Caller must grant at least this much via the calling job's `permissions:` block.
     # actions: read is required by github/codeql-action/upload-sarif when the
